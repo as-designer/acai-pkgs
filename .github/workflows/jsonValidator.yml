@@ -1,0 +1,109 @@
+name: Validate PR JSON Syntax
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  validate-json:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate Bot Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.JSON_BOT_APP_ID }}
+          private-key: ${{ secrets.JSON_BOT_PRIVATE_KEY }}
+
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Install jq (JSON parser)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check JSON Syntax
+        id: syntax-check
+        run: |
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...origin/${{ github.head_ref }} | grep '\.json$' || true)
+          
+          if [ -z "$FILES" ]; then
+            echo "No JSON files were modified."
+            echo "has_json=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "has_json=true" >> $GITHUB_OUTPUT
+
+          FAILED=false
+          ERROR_LOG=""
+
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              echo "Checking configuration syntax for: $file"
+              if ! jq . "$file" > /dev/null 2> error.txt; then
+                FAILED=true
+                ERROR_LOG+=$'\n'
+                ERROR_LOG+="❌ **File:** \`$file\`"$'\n'
+                ERROR_LOG+="\`\`\`"$'\n'
+                ERROR_LOG+=$(cat error.txt)$'\n'
+                ERROR_LOG+="\`\`\`"$'\n'
+              fi
+            fi
+          done <<< "$FILES"
+
+          if [ "$FAILED" = true ]; then
+            echo "SYNTAX_ERRORS<<EOF" >> $GITHUB_ENV
+            echo "$ERROR_LOG" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+            exit 1
+          fi
+
+      - name: Handle Success (Comment & Remove Label)
+        if: success() && steps.syntax-check.outputs.has_json == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "✅ **Automated Validation Passed:** All modified JSON package manifests contain valid syntax. A repository moderator will review your package submission shortly."
+            });
+
+            try {
+              await github.rest.issues.removeLabel({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'JSON-Syntax-Error'
+              });
+            } catch (error) {
+              console.log("No existing error label to remove.");
+            }
+
+      - name: Handle Failure (Comment & Add Label)
+        if: failure() && steps.syntax-check.conclusion == 'failure'
+        uses: actions/github-script@v7
+        env:
+          SYNTAX_ERRORS: ${{ env.SYNTAX_ERRORS }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const errors = process.env.SYNTAX_ERRORS || "Unknown syntax parsing error.";
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "⚠️ **Automated Validation Failed:** We detected syntax errors in your submitted JSON manifests. Please fix the formatting errors below and push your updates to this PR:\n\n" + errors
+            });
+
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['JSON-Syntax-Error']
+            });
